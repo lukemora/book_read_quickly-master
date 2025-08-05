@@ -1,0 +1,314 @@
+/* 
+一个响应式数据最基本的实现依赖于对“读取”和“设置”操作的拦截，从而在副作用函数与响应式数据之间建立联系。
+当“读取”操作发生时，我们将当前执行的副作用函数存储到“桶”中；
+当“设置”操作发生时，再将副作用函数从“桶”里取出并执行。这就是响应系统的根本实现原理。
+
+问题：响应式数据与副作用函数之间建立更加精确的联系
+解决：使用 WeakMap 配合Map 构建了新的“桶”结构。
+
+问题：WeakMap 与 Map 这两个数据结构之间的区别
+原因：WeakMap 是弱引用的，它不影响垃圾回收器的工作。当用户代码对一个对象没有引用关系时，WeakMap 不会阻止垃圾回收器回收该对象。
+
+问题：分支切换导致的冗余副作用的问题，会导致副作用函数进行不必要的更新。
+解决：
+    在每次副作用函数重新执行之前，清除上一次建立的响应联系，
+    而当副作用函数重新执行后，会再次建立新的响应联系，新的响应联系中不存在冗余副作用问题。
+
+问题：遍历 Set 数据结构导致无限循环的新问题，
+原因：即“在调用 forEach 遍历 Set 集合时，如果一个值已经被访问过了，但这个值被删除并重新添加到集合，如果此时forEach 遍历没有结束，那么这个值会重新被访问。”
+解决：解决方案是建立一个新的 Set 数据结构用来遍历。
+
+问题：嵌套的副作用函数的问题(父子组件)。响应式数据与副作用函数之间建立的响应联系发生错乱。
+解决：
+    需要使用副作用函数栈来存储不同的副作用函数。
+    当一个副作用函数执行完毕后，将其从栈中弹出。
+    当读取响应式数据的时候，被读取的响应式数据只会与当前栈顶的副作用函数建立响应联系。
+
+
+问题：副作用函数无限递归地调用自身，导致栈溢出的问题。
+原因：对响应式数据的读取和设置操作发生在同一个副作用函数内。
+解决：如果 trigger触发执行的副作用函数与当前正在执行的副作用函数相同，则不触发执行。
+
+问题：当trigger 动作触发副作用函数重新执行时，有能力决定副作用函数执行的时机、次数以及方式(响应系统的可调度性)。
+解决：
+    为 effect 函数增加了第二个选项参数，可以通过 scheduler 选项指定调用器，这样用户可以通过调度器自行完成任务的调度。
+    通过调度器实现任务去重，即通过一个微任务队列对任务进行缓存，从而实现去重。
+
+问题：计算属性实现原理
+原理：
+    计算属性实际上是一个懒执行的副作用函数，我们通过 lazy 选项使得副作用函数可以懒执行。
+    被标记为懒执行的副作用函数可以通过手动方式让其执行。
+    当读取计算属性的值时，只需要手动执行副作用函数即可。
+    当计算属性依赖的响应式数据发生变化时，会通过 scheduler 将 dirty 标记设置为 true，代表“脏”。
+    下次读取计算属性的值时，会重新计算真正的值。 
+
+问题： watch 的实现原理。
+原理：
+    它本质上利用了副作用函数重新执行时的可调度性。
+    一个 watch 本身会创建一个 effect，当这个 effect 依赖的响应式数据发生变化时，会执行该 effect 的调度器函数，即 scheduler。
+    这里的 scheduler 可以理解为“回调”，所以我们只需要在 scheduler 中执行用户通过 watch 函数注册的回调函数即可。
+    立即执行回调的 watch，通过添加新的 immediate 选项来实现，
+    控制回调函数的执行时机，通过 flush 选项来指定回调函数具体的执行时机，本质上是利用了调用器和异步的微任务队列。    
+
+问题：过期的副作用函数，导致竞态问题。
+解决：
+    watch 的回调函数设计了第三个参数，即onInvalidate。它是一个函数，用来注册过期回调。
+    每当 watch 的回调函数执行之前，会优先执行用户通过 onInvalidate 注册的过期回调。
+    用户就有机会在过期回调中将上一次的副作用标记为“过期”，从而解决竞态问题。
+*/
+
+{
+	const data = {
+		name: 'james',
+		age: 20,
+	};
+	const bucket = new WeakMap();
+	const effectStack = [];
+	let activeEffect;
+	const proxy = new Proxy(data, {
+		// receiver 代表谁在读取对象 可以理解为含义调用过程中的this; 如：p.bar 代表 p在读取bar属性
+		get(target, key, receiver) {
+			track(target, key);
+			// 这里的this实际是原始对象data, target[key]访问无法建立响应联系
+			// return target[key];
+			return Reflect.get(target, key, receiver);
+		},
+		set(target, key, newVal, receiver) {
+			// target[key] = newVal;
+			const res = Reflect.set(target, key, newVal, receiver);
+			trigger(target, key);
+			return res;
+		},
+	});
+
+	function track(target, key) {
+		if (!activeEffect) return target[key];
+		// 解决：响应式数据与副作用函数之间建立更加精确的联系
+
+		// 根据 target 从“桶”中取得 depsMap，它也是一个 Map 类型：key -->effects;
+		let depsMap = bucket.get(target);
+		// 如果不存在depsMap 则简历一个map并与target关联
+		if (!depsMap) {
+			depsMap = new Map();
+			bucket.set(target, depsMap);
+		}
+		// 根据key从depsMap中取出deps
+		// 里面存储着所有与当前 key 相关联的副作用函数：effects
+		let deps = depsMap.get(key);
+		// 如果 deps 不存在，同样新建一个 Set 并与 key 关联
+		if (!deps) {
+			deps = new set();
+			depsMap.set(key, deps);
+		}
+		// 最后将当前激活的副作用函数添加到“桶”里
+		deps.add(activeEffect);
+		// deps 就是一个与当前副作用函数存在联系的依赖集合
+		// 将其添加到 activeEffect.deps 数组中
+		activeEffect.deps.push(deps);
+	}
+
+	function trigger(target, key) {
+		const depsMap = bucket.get(target);
+		if (!depsMap) return;
+		const effects = depsMap.get(key);
+		const effectsToRun = new set();
+		effects?.forEach(effectFn => {
+			// 解决: 副作用函数无限递归地调用自身，导致栈溢出的问题
+			// 如果 trigger 触发执行的副作用函数与当前正在执行的副作用函数相同，则不触发执行
+			if (effectFn !== activeEffect) {
+				// 新增
+				effectsToRun.add(effectFn);
+			}
+		});
+		effectsToRun.forEach(effectFn => {
+			//解决：当trigger 动作触发副作用函数重新执行时，有能力决定副作用函数执行的时机、次数以及方式(响应系统的可调度性)
+			// 如果一个副作用函数存在调度器，则调用该调度器，并将副作用函数作为参数传递;
+			if (effectFn.options.scheduler) {
+				effectFn.options.scheduler(effectFn);
+			} else {
+				effectFn();
+			}
+		});
+	}
+
+	function effect(fn, options = {}) {
+		const effectFn = () => {
+			// 解决：分支切换导致的冗余副作用的问题，会导致副作用函数进行不必要的更新
+			cleanup(effectFn);
+
+			// 当 effectFn 执行时，将其设置为当前激活的副作用函数
+			activeEffect = effectFn;
+			// 解决： 嵌套的副作用函数的问题(父子组件)。响应式数据与副作用函数之间建立的响应联系发生错乱。
+			// 在调用副作用函数之前将当前副作用函数压入栈中
+			effectStack.push(effectFn);
+			const res = fn();
+			// 在当前副作用函数执行完毕后，将当前副作用函数弹出栈，并把 activeEffect 还原为之前的值
+			effectStack.pop();
+			activeEffect = effectStack[effectStack.length - 1];
+			return res;
+		};
+
+		effectFn.options = options;
+		// activeEffect.deps 用来存储所有与该副作用函数相关联的依赖集合
+		effectFn.deps = [];
+		if (!options.lazy) {
+			// 执行副作用函数
+			effectFn();
+		}
+		// 被标记为懒执行的副作用函数可以通过手动方式让其执行
+		return effectFn;
+	}
+
+	function cleanup(effectFn) {
+		for (let i = 0; i < effectFn.deps.length; i++) {
+			// deps 是依赖集合
+			const deps = effectFn.deps[i];
+			// 将 effectFn 从依赖集合中移除
+			deps.delete(effectFn);
+		}
+		effectFn.deps.length = 0;
+	}
+	// 定义一个任务队列
+	const jobQueue = new Set();
+	const p = Promise.resolve();
+	let isFlushing = false;
+	function flushJob() {
+		if (isFlushing) return;
+		isFlushing = true;
+		p.then(() => {
+			// 在微任务队列中刷新任务队列
+			jobQueue.forEach(job => job());
+		}).finally(() => {
+			isFlushing = false;
+		});
+	}
+	effect(
+		() => {
+			console.log(123);
+		},
+		{
+			scheduler(fn) {
+				// 每次调度时，将副作用函数添加到jobQueue队列中
+				jobQueue.add(fn);
+				// 刷新队列
+				flushJob();
+			},
+			lazy: false,
+		}
+	);
+
+	/* 
+        问题：计算属性实现原理
+        原理：
+            计算属性实际上是一个懒执行的副作用函数，我们通过 lazy 选项使得副作用函数可以懒执行。
+            被标记为懒执行的副作用函数可以通过手动方式让其执行。
+            当读取计算属性的值时，只需要手动执行副作用函数即可。
+            当计算属性依赖的响应式数据发生变化时，会通过 scheduler 将 dirty 标记设置为 true，代表“脏”。
+            下次读取计算属性的值时，会重新计算真正的值。 
+
+    */
+	function computed(getter) {
+		let value;
+		let dirty = true;
+		const effectFn = effect(getter, {
+			// 当计算属性依赖的响应式数据发生变化时，会通过 scheduler 将 dirty 标记设置为 true，代表“脏”。
+			// 下次读取计算属性的值时，会重新计算真正的值。
+			scheduler() {
+				if (!dirty) {
+					dirty = true;
+					trigger(obj, value);
+				}
+			},
+			lazy: true,
+		});
+
+		const obj = {
+			get value() {
+				if (dirty) {
+					// 当读取计算属性的值时，只需要手动执行副作用函数
+					value = effectFn();
+					dirty = false;
+				}
+				track(obj, 'value');
+				return value;
+			},
+		};
+
+		return obj;
+	}
+
+	/* 
+    问题： watch 的实现原理。
+    原理：
+        它本质上利用了副作用函数重新执行时的可调度性。
+        一个 watch 本身会创建一个 effect，当这个 effect 依赖的响应式数据发生变化时，会执行该 effect 的调度器函  数，即 scheduler。
+        这里的 scheduler 可以理解为“回调”，所以我们只需要在 scheduler 中执行用户通过 watch 函数注册的回调函数即 可。
+        立即执行回调的 watch，通过添加新的 immediate 选项来实现，
+        控制回调函数的执行时机，通过 flush 选项来指定回调函数具体的执行时机，本质上是利用了调用器和异步的微任队列。    
+
+    问题：过期的副作用函数，导致竞态问题
+    解决：
+        watch 的回调函数设计了第三个参数，即onInvalidate。它是一个函数，用来注册过期回调。
+        每当 watch 的回调函数执行之前，会优先执行用户通过 onInvalidate 注册的过期回调。
+        用户就有机会在过期回调中将上一次的副作用标记为“过期”，从而解决竞态问题。
+
+*/
+
+	function watch(source, cb, options = {}) {
+		let getter;
+		// 如果 source 是函数，说明用户传递的是 getter，所以直接把 source 赋值给 getter
+		if (typeof source === 'function') {
+			getter = source;
+		} else {
+			getter = () => traverse(source);
+		}
+		let oldValue, newValue;
+		let cleanup;
+
+		// 解决： 过期的副作用函数，导致竞态问题。
+		function onInvalidate(fn) {
+			// 将过期回调存储到cleanup中
+			cleanup = fn;
+		}
+
+		const job = () => {
+			// 在scheduler 中重新执行副作用函数，得到的是新值
+			newValue = effectFn();
+			// 将新值和旧值作为回调函数的参数
+			cb(newValue, oldValue, onInvalidate);
+			// 更新旧值，不然下一次会得到错误的旧值
+			oldValue = newValue;
+		};
+		const effectFn = effect(() => getter(), {
+			lazy: true,
+			scheduler: () => {
+				// 在调度函数中判断flush是否为post， 如果是，将其放到微任务队列中执行
+				if (options.flush === 'post') {
+					const p = Promise.resolve();
+					p.then(job);
+				} else {
+					job();
+				}
+			},
+		});
+		if (options.immediate) {
+			// 当immediate 为true时立即执行job，从而触发回调执行
+			job();
+		} else {
+			// 手动调用副作用函数，得到的值就是旧值
+			oldValue = effectFn();
+		}
+	}
+
+	function traverse(value, seen = new Set()) {
+		// 如果要读取的数据是原始值，或者已经被读取过了，那么什么都不做
+		if (typeof value !== 'object' || value === null || seen.has(value)) return;
+		// 将数据添加到seen中，代表遍历读取过了，避免循环引用引起的死循环
+		seen.add(value);
+		// 假设 value 就是一个对象，使用 for...in 读取对象的每一个值，并递归地调用 traverse 进行处理
+		for (const key in value) {
+			traverse(value[k], seen);
+		}
+		return value;
+	}
+}
